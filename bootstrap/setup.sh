@@ -163,6 +163,14 @@ AllowUsers ${ADMIN_USER}
 X11Forwarding no
 EOF
 
+  # sshd -t は privilege separation 用の /run/sshd が無いと失敗する。
+  # このディレクトリは ssh.service の RuntimeDirectory= が作るものだが、
+  # Ubuntu 24.04 の既定は ssh.socket による socket activation なので、
+  # 初回の接続があるまで ssh.service は起動せずディレクトリも存在しない。
+  # /run は tmpfs で再起動のたびに消えるため、起動直後に走るこのスクリプトからは
+  # 常に存在しない。無ければ作る（ssh.service が作るものと同じ属性）。
+  install -d -m 0755 -o root -g root /run/sshd
+
   # 文法チェックに落ちたら drop-in を残さない。
   # 残すと、次にsshdが再起動したときに起動しなくなる。
   if ! sshd -t; then
