@@ -6,7 +6,10 @@
 #   A. さくらのスタートアップスクリプト経由（推奨。bootstrap/startup-script.sh を参照）
 #   B. さくらのコンソールから手動:
 #        sudo SSH_PUBLIC_KEY='ssh-ed25519 AAAA...' \
-#             bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/m-ino-jp/main/bootstrap/setup.sh)"
+#             bash -c "$(curl -fsSL https://raw.githubusercontent.com/m-ino13/m-ino-jp-bootstrap/main/bootstrap/setup.sh)"
+#
+#      取得元は公開用リポジトリ（m-ino-jp-bootstrap）。本体（m-ino-jp）は非公開で、
+#      raw.githubusercontent.com から認証なしには取得できない。
 #
 # 冪等。何度実行しても同じ結果になる。
 
@@ -17,7 +20,17 @@ HOSTNAME_FQDN="${HOSTNAME_FQDN:-m-ino.jp}"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
 SWAP_SIZE_GB="${SWAP_SIZE_GB:-8}"
 
+# ブート直後は cloud-init や自動更新と dpkg のロックが競合する。すぐ諦めずに待つ。
+APT_OPTS=(-o DPkg::Lock::Timeout=300)
+
 log() { printf '\n=== %s ===\n' "$*"; }
+
+# 後で読み飛ばされないよう、警告は最後にまとめて再掲する。
+WARNINGS=()
+warn() {
+  WARNINGS+=("$*")
+  printf '警告: %s\n' "$*" >&2
+}
 
 if [[ $EUID -ne 0 ]]; then
   echo "rootで実行してください" >&2
@@ -31,6 +44,13 @@ log "OS: ${PRETTY_NAME}"
 log "1. ホスト名とタイムゾーン"
 # ---------------------------------------------------------------------------
 hostnamectl set-hostname "${HOSTNAME_FQDN}"
+
+# /etc/hosts を揃えないと sudo のたびに "unable to resolve host" が出る。
+# 該当行を消してから足すことで、何度実行しても1行だけになる。
+short_hostname="${HOSTNAME_FQDN%%.*}"
+sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+printf '127.0.1.1\t%s %s\n' "${HOSTNAME_FQDN}" "${short_hostname}" >> /etc/hosts
+
 timedatectl set-timezone Asia/Tokyo
 # ロケールは英語のまま。日本語化するとログが読みづらくなり、
 # 検索でヒットする情報とも食い違うため。
@@ -39,9 +59,9 @@ timedatectl set-timezone Asia/Tokyo
 log "2. パッケージ更新と基本ツール"
 # ---------------------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get -y upgrade
-apt-get install -y \
+apt-get "${APT_OPTS[@]}" update
+apt-get "${APT_OPTS[@]}" -y upgrade
+apt-get "${APT_OPTS[@]}" install -y \
   ca-certificates curl gnupg git jq \
   ufw fail2ban unattended-upgrades needrestart \
   htop ncdu
@@ -55,10 +75,13 @@ if [[ ! -f /swapfile ]]; then
   fallocate -l "${SWAP_SIZE_GB}G" /swapfile
   chmod 600 /swapfile
   mkswap /swapfile
-  swapon /swapfile
 else
   echo "/swapfile は既に存在するのでスキップ"
 fi
+
+# 有効化は存在チェックとは別に行う。ファイルはあるが swapon されていない
+# 状態（fstab を書く前に落ちた場合など）でも回復できるようにするため。
+swapon --show=NAME --noheadings | grep -qx '/swapfile' || swapon /swapfile
 
 if ! grep -q '^/swapfile' /etc/fstab; then
   echo '/swapfile none swap sw 0 0' >> /etc/fstab
@@ -76,23 +99,46 @@ EOF
 sysctl --system >/dev/null
 
 # ---------------------------------------------------------------------------
-log "4. SSH公開鍵の配置"
+log "4. 管理ユーザーとSSH公開鍵"
 # ---------------------------------------------------------------------------
-# sshdを固める前に鍵を置く。順序を逆にすると締め出される。
+# sshdを固める前にユーザーと鍵を用意する。順序を逆にすると締め出される。
+if ! id -u "${ADMIN_USER}" >/dev/null 2>&1; then
+  adduser --disabled-password --gecos "" "${ADMIN_USER}"
+fi
+
+# 既存ユーザー（さくらの標準OSインストールが作ったもの）でも所属を保証する。
+# ユーザー作成ブロックの中に置くと、既存ユーザーのときに実行されない。
+usermod -aG sudo "${ADMIN_USER}"
+
+user_home="$(getent passwd "${ADMIN_USER}" | cut -d: -f6)"
+admin_group="$(id -gn "${ADMIN_USER}")"
+admin_authorized_keys="${user_home}/.ssh/authorized_keys"
+
+# パスワードが無いと sudo が使えず、締め出されたときのコンソールログインもできない。
+# 復旧経路が消えるので、状態を確認して警告する。
+if [[ "$(passwd -S "${ADMIN_USER}" | awk '{print $2}')" != "P" ]]; then
+  warn "${ADMIN_USER} にパスワードが設定されていない。sudo とコンソールからの緊急ログインができない。root のうちに 'passwd ${ADMIN_USER}' を実行すること"
+fi
+
 if [[ -n "${SSH_PUBLIC_KEY}" ]]; then
-  if ! id -u "${ADMIN_USER}" >/dev/null 2>&1; then
-    adduser --disabled-password --gecos "" "${ADMIN_USER}"
-    usermod -aG sudo "${ADMIN_USER}"
+  install -d -m 700 -o "${ADMIN_USER}" -g "${admin_group}" "${user_home}/.ssh"
+
+  # 追記ではなく上書きする（冪等性のため）。ここで渡した鍵だけが残り、
+  # さくらのコントロールパネルで登録した鍵や2本目の鍵は消える。
+  # 消える内容は setup.log に残しておく（公開鍵なのでログに出しても問題ない）。
+  if [[ -s "${admin_authorized_keys}" ]]; then
+    echo "--- 上書き前の authorized_keys ---"
+    cat "${admin_authorized_keys}"
+    echo "----------------------------------"
   fi
-  user_home="$(getent passwd "${ADMIN_USER}" | cut -d: -f6)"
-  install -d -m 700 -o "${ADMIN_USER}" -g "${ADMIN_USER}" "${user_home}/.ssh"
-  install -m 600 -o "${ADMIN_USER}" -g "${ADMIN_USER}" /dev/stdin \
-    "${user_home}/.ssh/authorized_keys" <<EOF
+
+  install -m 600 -o "${ADMIN_USER}" -g "${admin_group}" /dev/stdin \
+    "${admin_authorized_keys}" <<EOF
 ${SSH_PUBLIC_KEY}
 EOF
-  echo "公開鍵を ${user_home}/.ssh/authorized_keys に配置した"
+  echo "公開鍵を ${admin_authorized_keys} に配置した"
 else
-  echo "警告: SSH_PUBLIC_KEY が空。さくらのコントロールパネルで登録済みか確認すること" >&2
+  warn "SSH_PUBLIC_KEY が空。既存の ${admin_authorized_keys} をそのまま使う"
 fi
 
 # ---------------------------------------------------------------------------
@@ -100,7 +146,16 @@ log "5. sshd の設定"
 # ---------------------------------------------------------------------------
 # 元の sshd_config は書き換えず drop-in を置く。
 # OSアップグレードで元ファイルが更新されても設定が残る。
-install -m 644 -D /dev/stdin /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+#
+# ファイル名が 01- なのは、sshd が「最初に見つかった値」を採用し、
+# Include が辞書順に読まれるため。cloud-init が置く 50-cloud-init.conf に
+# PasswordAuthentication yes が入っていることがあり、99- では負けて黙って無視される。
+rm -f /etc/ssh/sshd_config.d/99-hardening.conf   # 旧版の名残を掃除する
+
+sshd_hardening_conf=/etc/ssh/sshd_config.d/01-hardening.conf
+
+if [[ -s "${admin_authorized_keys}" ]]; then
+  install -m 644 -D /dev/stdin "${sshd_hardening_conf}" <<EOF
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -108,9 +163,31 @@ AllowUsers ${ADMIN_USER}
 X11Forwarding no
 EOF
 
-# 設定の文法チェック。失敗したら適用せず止める。
-sshd -t
-systemctl reload ssh || systemctl reload sshd
+  # 文法チェックに落ちたら drop-in を残さない。
+  # 残すと、次にsshdが再起動したときに起動しなくなる。
+  if ! sshd -t; then
+    rm -f "${sshd_hardening_conf}"
+    echo "sshd の設定が不正だったため、適用せずに中止した" >&2
+    exit 1
+  fi
+
+  # Ubuntu 24.04 は既定で ssh.socket による socket activation。
+  # その場合 ssh.service は動いていないので reload は失敗するが、
+  # 接続のたびに sshd が起動して設定を読み直すため reload 自体が不要。
+  if systemctl is-active --quiet ssh.socket; then
+    echo "ssh.socket による socket activation。次の接続から新しい設定が使われる"
+  elif ! systemctl reload ssh 2>/dev/null; then
+    systemctl reload sshd 2>/dev/null || warn "sshd の reload に失敗した。手動で確認すること"
+  fi
+
+  # drop-in の優先順位を間違えると設定が黙って無視されるため、実効値を出す。
+  echo "--- sshd の実効設定 ---"
+  sshd -T | grep -Ei '^(passwordauthentication|permitrootlogin|allowusers|kbdinteractiveauthentication)' || true
+  echo "-----------------------"
+else
+  rm -f "${sshd_hardening_conf}"
+  warn "authorized_keys が空のため sshd のハードニングをスキップした。鍵が無い状態でパスワード認証を無効化すると誰もログインできなくなる"
+fi
 
 # 締め出されてもさくらのコンソール（シリアルコンソール）からは
 # パスワードでログインできる。ino のパスワードは必ず控えておくこと。
@@ -128,6 +205,10 @@ ufw --force enable
 
 # 重要: Dockerが -p で公開したポートはufwを迂回する。
 # 対策として、80/443を公開するのはCaddyコンテナだけに限定する運用を守ること。
+#
+# 注意: reset はDockerが入れたiptablesのチェインも巻き込む。この後の手順10で
+# dockerを再起動するので通しで実行する分には問題ないが、この節だけを
+# 単独で流し直したときは `systemctl restart docker` も実行すること。
 
 # ---------------------------------------------------------------------------
 log "7. fail2ban"
@@ -143,7 +224,8 @@ maxretry = 5
 enabled = true
 backend = systemd
 EOF
-systemctl enable --now fail2ban
+systemctl enable fail2ban
+# 既に起動している場合、enable --now では設定が読み直されないので restart する。
 systemctl restart fail2ban
 
 # ---------------------------------------------------------------------------
@@ -174,7 +256,9 @@ systemctl enable --now unattended-upgrades
 # ---------------------------------------------------------------------------
 log "9. ログの永続化とローテーション"
 # ---------------------------------------------------------------------------
+# [Journal] セクションヘッダは必須。無いと全行が黙って無視される。
 install -m 644 -D /dev/stdin /etc/systemd/journald.conf.d/99-m-ino-jp.conf <<'EOF'
+[Journal]
 # 再起動をまたいでログを残す。200GBのSSDに対して500MBは十分小さい。
 Storage=persistent
 SystemMaxUse=500M
@@ -198,8 +282,8 @@ install -m 644 -D /dev/stdin /etc/apt/sources.list.d/docker.list <<EOF
 deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable
 EOF
 
-apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io \
+apt-get "${APT_OPTS[@]}" update
+apt-get "${APT_OPTS[@]}" install -y docker-ce docker-ce-cli containerd.io \
   docker-buildx-plugin docker-compose-plugin
 
 install -m 644 -D /dev/stdin /etc/docker/daemon.json <<'EOF'
@@ -227,19 +311,30 @@ docker network inspect edge >/dev/null 2>&1 || docker network create edge
 # ---------------------------------------------------------------------------
 log "11. ディレクトリと通知スクリプト"
 # ---------------------------------------------------------------------------
-install -d -m 755 -o "${ADMIN_USER}" -g "${ADMIN_USER}" /srv/m-ino-jp
-install -d -m 755 -o "${ADMIN_USER}" -g "${ADMIN_USER}" /srv/data
-install -d -m 750 /etc/m-ino-jp
+install -d -m 755 -o "${ADMIN_USER}" -g "${admin_group}" /srv/m-ino-jp
+install -d -m 755 -o "${ADMIN_USER}" -g "${admin_group}" /srv/data
+
+# 書き込みはrootだけ、読み取りは管理ユーザーにも許す。
+# notify-discord を ino がそのまま実行できるようにするため。
+install -d -m 750 -o root -g "${admin_group}" /etc/m-ino-jp
 
 # Discord Webhook への通知。メールサーバを立てない代わりの仕組み。
 install -m 755 -D /dev/stdin /usr/local/bin/notify-discord <<'EOF'
 #!/usr/bin/env bash
 # 使い方: notify-discord "メッセージ"
-#   systemd からは OnFailure= 経由で呼ぶ
+#   systemd からは OnFailure=notify-discord@%n.service 経由で呼ぶ
 set -euo pipefail
-[[ -f /etc/m-ino-jp/notify.env ]] || exit 0
+
+if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
+  echo "notify-discord: /etc/m-ino-jp/notify.env が無いか読めない" >&2
+  exit 1
+fi
 . /etc/m-ino-jp/notify.env
-[[ -n "${DISCORD_WEBHOOK_URL:-}" ]] || exit 0
+
+if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
+  echo "notify-discord: DISCORD_WEBHOOK_URL が未設定" >&2
+  exit 1
+fi
 
 message="${1:-(メッセージなし)}"
 payload=$(jq -Rn --arg c "[$(hostname)] ${message}" '{content: $c}')
@@ -247,11 +342,27 @@ curl -fsS -H 'Content-Type: application/json' -d "${payload}" \
   "${DISCORD_WEBHOOK_URL}" >/dev/null
 EOF
 
+# OnFailure= はユニット名しか受け取れないため、スクリプトを包むテンプレートユニットを置く。
+# 使う側は  OnFailure=notify-discord@%n.service  と書く。
+install -m 644 -D /dev/stdin /etc/systemd/system/notify-discord@.service <<'EOF'
+[Unit]
+Description=Discord notification for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/notify-discord "%i の実行に失敗しました"
+EOF
+systemctl daemon-reload
+
 if [[ ! -f /etc/m-ino-jp/notify.env ]]; then
-  install -m 600 -D /dev/stdin /etc/m-ino-jp/notify.env <<'EOF'
+  install -m 640 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.env <<'EOF'
 # Discord の Webhook URL をここに設定する。このファイルはGit管理外。
 DISCORD_WEBHOOK_URL=
 EOF
+else
+  # 既存の値は残したまま、権限だけ揃える
+  chown root:"${admin_group}" /etc/m-ino-jp/notify.env
+  chmod 640 /etc/m-ino-jp/notify.env
 fi
 
 # ---------------------------------------------------------------------------
@@ -263,10 +374,12 @@ cat <<EOF
 
   1. ローカルから SSH で接続できることを確認
        ssh ${ADMIN_USER}@<VPSのIP>
+     （このスクリプトが配置した鍵だけが有効。他の鍵は上書きで消えている）
 
-  2. ${ADMIN_USER} のパスワードを設定し、1Password に保管する
-     （さくらのコンソールからの緊急ログイン用）
-       sudo passwd ${ADMIN_USER}
+  2. ${ADMIN_USER} のパスワードが設定されているか確認する
+     （さくらのコンソールからの緊急ログインと sudo に必要）
+       passwd -S ${ADMIN_USER}     # 2列目が P なら設定済み
+       sudo passwd ${ADMIN_USER}   # P でなければ設定する
 
   3. /etc/m-ino-jp/notify.env に Discord Webhook URL を設定
        sudo vi /etc/m-ino-jp/notify.env
@@ -275,9 +388,15 @@ cat <<EOF
   4. DNS の A レコードを VPS の IP に向ける
 
   5. リポジトリを /srv/m-ino-jp に clone し、Caddy から構築を始める
+     （本体リポジトリは非公開。deploy key が要る。docs/10-os-setup.md の手順8）
 
 現在の状態:
 EOF
 free -h
 echo
 ufw status verbose
+
+if ((${#WARNINGS[@]} > 0)); then
+  printf '\n=== 警告 (%d件) ===\n' "${#WARNINGS[@]}"
+  printf -- '- %s\n' "${WARNINGS[@]}"
+fi
