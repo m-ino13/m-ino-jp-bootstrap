@@ -240,10 +240,16 @@ systemctl restart fail2ban
 log "8. 自動セキュリティアップデート"
 # ---------------------------------------------------------------------------
 # 深夜の数分の停止は許容する方針。再起動を自動化する。
+#
+# 更新取得(apt-daily.timer) → 適用(apt-daily-upgrade.timer) → 再起動 の順に
+# 時刻を早朝へずらす。unattended-upgrade コマンドは apt-get update 相当の
+# キャッシュ更新を自分では行わず /var/lib/apt/lists/ をそのまま使うため、
+# 適用側だけずらしても取得側(デフォルトは6,18:00±12hとかなり緩い)が
+# 追いつかないことがある。両方揃えて早める。
 install -m 644 -D /dev/stdin /etc/apt/apt.conf.d/52-m-ino-jp-unattended <<'EOF'
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
-Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+Unattended-Upgrade::Automatic-Reboot-Time "05:00";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF
@@ -253,6 +259,27 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+
+# apt-daily.timer（更新取得）を 03:00±10分 に。OnCalendar= を空にしてから
+# 上書きしないと元ユニットの値に追加されてしまう点に注意。
+install -m 644 -D /dev/stdin /etc/systemd/system/apt-daily.timer.d/99-m-ino-jp.conf <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 03:00
+RandomizedDelaySec=10m
+EOF
+
+# apt-daily-upgrade.timer（適用）を 03:20±15分 に。取得(03:00〜03:10完了見込み)
+# との間に10分の余裕を置く。
+install -m 644 -D /dev/stdin /etc/systemd/system/apt-daily-upgrade.timer.d/99-m-ino-jp.conf <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 03:20
+RandomizedDelaySec=15m
+EOF
+
+systemctl daemon-reload
+systemctl restart apt-daily.timer apt-daily-upgrade.timer
 
 # needrestart が対話プロンプトを出すと自動更新が止まるので自動再起動にする
 install -m 644 -D /dev/stdin /etc/needrestart/conf.d/99-m-ino-jp.conf <<'EOF'
@@ -362,6 +389,39 @@ ExecStart=/usr/local/bin/notify-discord "%i の実行に失敗しました"
 EOF
 systemctl daemon-reload
 
+# 汎用の通知エントリポイント。/etc/m-ino-jp/notify.d/ 配下の実行可能ファイルを
+# 全て呼ぶだけで、宛先を知らない。スキャン結果の通知のように「失敗ではないが
+# 知らせたい」用途向け（OnFailure= は失敗時専用でこれには使えない）。
+# 通知経路を増やすとき（将来メールサーバを立てた場合など）は、このディレクトリに
+# スクリプトを追加するだけでよく、呼び出し側は変更不要。
+install -m 755 -D /dev/stdin /usr/local/bin/notify <<'EOF'
+#!/usr/bin/env bash
+# 使い方: notify "メッセージ"
+set -euo pipefail
+
+msg="${1:?メッセージを指定してください}"
+shopt -s nullglob
+channels=(/etc/m-ino-jp/notify.d/*)
+
+if [[ ${#channels[@]} -eq 0 ]]; then
+  echo "notify: /etc/m-ino-jp/notify.d/ にチャンネルが無い" >&2
+  exit 1
+fi
+
+status=0
+for channel in "${channels[@]}"; do
+  [[ -x "${channel}" ]] || continue
+  "${channel}" "${msg}" || { echo "notify: ${channel} が失敗しました" >&2; status=1; }
+done
+exit "${status}"
+EOF
+
+install -d -m 750 -o root -g "${admin_group}" /etc/m-ino-jp/notify.d
+install -m 750 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.d/10-discord <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/bin/notify-discord "$@"
+EOF
+
 if [[ ! -f /etc/m-ino-jp/notify.env ]]; then
   install -m 640 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.env <<'EOF'
 # Discord の Webhook URL をここに設定する。このファイルはGit管理外。
@@ -392,6 +452,7 @@ cat <<EOF
   3. /etc/m-ino-jp/notify.env に Discord Webhook URL を設定
        sudo vi /etc/m-ino-jp/notify.env
        notify-discord "テスト通知"
+       notify "テスト通知（notify.d 経由）"
 
   4. DNS の A レコードを VPS の IP に向ける
 
