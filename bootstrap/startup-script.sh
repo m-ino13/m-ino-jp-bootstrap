@@ -21,11 +21,11 @@
 set -euo pipefail
 
 # --- ここを書き換える ------------------------------------------------------
-SSH_PUBLIC_KEY='ssh-ed25519 AAAA...ここに公開鍵を貼る... ino@local'
+SSH_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMT4CDaEDibpQNwKzhWOYvXXODAZ9cpGaLeXioe/ImH4 container_for_claude'
 ADMIN_USER='ino'
 HOSTNAME_FQDN='m-ino.jp'
 # 公開用リポジトリ（m-ino-jp-bootstrap）を指す。本体（m-ino-jp）ではない。
-REPO_RAW_BASE='https://raw.githubusercontent.com/YOUR_GITHUB_USER/m-ino-jp-bootstrap/main'
+REPO_RAW_BASE='https://raw.githubusercontent.com/m-ino13/m-ino-jp-bootstrap/main'
 # ---------------------------------------------------------------------------
 
 export SSH_PUBLIC_KEY ADMIN_USER HOSTNAME_FQDN
