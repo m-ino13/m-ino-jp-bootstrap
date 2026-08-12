@@ -21,12 +21,14 @@
 
 ```bash
 # m-ino-jp のリポジトリルートで実行
-rsync -av --delete bootstrap/ ../m-ino-jp-bootstrap/bootstrap/
+rsync -av --delete --exclude=startup-script.sh bootstrap/ ../m-ino-jp-bootstrap/bootstrap/
 cd ../m-ino-jp-bootstrap
 git add -A
 git commit -m "sync from m-ino-jp bootstrap/"
 git push
 ```
+
+**`startup-script.sh` は同期しない。** これはコントロールパネルに貼り付けて使うもので、HTTPで取得する必要がない。公開する必要があるのは `setup.sh` だけなので、公開範囲は最小にしておく。
 
 自動化（GitHub Actions等）は行わない。変更頻度が低く、手動コピーで十分足りるため。
 
@@ -34,8 +36,8 @@ git push
 
 ```bash
 # GitHub上で m-ino-jp-bootstrap という名前の「公開」リポジトリを作成してから
-git clone https://github.com/自分のユーザー名/m-ino-jp-bootstrap.git ../m-ino-jp-bootstrap
-rsync -av bootstrap/ ../m-ino-jp-bootstrap/bootstrap/
+git clone https://github.com/m-ino13/m-ino-jp-bootstrap.git ../m-ino-jp-bootstrap
+rsync -av --exclude=startup-script.sh bootstrap/ ../m-ino-jp-bootstrap/bootstrap/
 cd ../m-ino-jp-bootstrap
 git add -A
 git commit -m "initial import"
