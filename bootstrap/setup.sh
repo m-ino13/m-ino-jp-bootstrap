@@ -16,7 +16,13 @@
 set -euo pipefail
 
 ADMIN_USER="${ADMIN_USER:-ino}"
-HOSTNAME_FQDN="${HOSTNAME_FQDN:-m-ino.jp}"
+# 公開ドメイン（m-ino.jp）と同じ文字列にしないこと。VPSのホスト名と
+# 公開ドメインが一致すると、systemd-resolvedがそのドメイン名への問い合わせを
+# 実DNSに問い合わせずローカル合成応答（127.0.1.1）で返すようになり、コンテナ
+# 内からのサーバー間通信（OIDCのトークン交換など）が失敗する
+# （docs/adr/0013-auth-domain-dns-loopback.md）。ドット無しの文字列にしておけば
+# どのDNSレコードとも一致しないため、この衝突が起こらない。
+HOSTNAME_FQDN="${HOSTNAME_FQDN:-m-ino-jp}"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
 SWAP_SIZE_GB="${SWAP_SIZE_GB:-8}"
 
