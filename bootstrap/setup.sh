@@ -376,7 +376,7 @@ install -d -m 750 -o root -g "${admin_group}" /etc/m-ino-jp
 install -m 755 -D /dev/stdin /usr/local/bin/notify-discord <<'EOF'
 #!/usr/bin/env bash
 # 使い方: notify-discord "メッセージ"
-#   systemd からは OnFailure=notify-discord@%n.service 経由で呼ぶ
+#   systemd からは notify.d/10-discord 経由（OnFailure=notify@%n.service）で呼ばれる
 set -euo pipefail
 
 if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
@@ -396,16 +396,50 @@ curl -fsS -H 'Content-Type: application/json' -d "${payload}" \
   "${DISCORD_WEBHOOK_URL}" >/dev/null
 EOF
 
-# OnFailure= はユニット名しか受け取れないため、スクリプトを包むテンプレートユニットを置く。
-# 使う側は  OnFailure=notify-discord@%n.service  と書く。
-install -m 644 -D /dev/stdin /etc/systemd/system/notify-discord@.service <<'EOF'
+# Brevo Transactional Email API への通知。notify-discordと対称的な構成
+# （docs/adr/0030-notify-email-brevo.md）。
+install -m 755 -D /dev/stdin /usr/local/bin/notify-email <<'EOF'
+#!/usr/bin/env bash
+# 使い方: notify-email "メッセージ"
+set -euo pipefail
+
+if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
+  echo "notify-email: /etc/m-ino-jp/notify.env が無いか読めない" >&2
+  exit 1
+fi
+. /etc/m-ino-jp/notify.env
+
+if [[ -z "${BREVO_API_KEY:-}" || -z "${BREVO_NOTIFY_FROM:-}" || -z "${BREVO_NOTIFY_TO:-}" ]]; then
+  echo "notify-email: BREVO_API_KEY / BREVO_NOTIFY_FROM / BREVO_NOTIFY_TO が未設定" >&2
+  exit 1
+fi
+
+message="${1:-(メッセージなし)}"
+payload=$(jq -n \
+  --arg from "${BREVO_NOTIFY_FROM}" \
+  --arg to "${BREVO_NOTIFY_TO}" \
+  --arg subj "[$(hostname)] m-ino.jp 通知" \
+  --arg text "${message}" \
+  '{sender:{email:$from}, to:[{email:$to}], subject:$subj, textContent:$text}')
+
+curl -fsS -X POST "https://api.brevo.com/v3/smtp/email" \
+  -H "api-key: ${BREVO_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "${payload}" >/dev/null
+EOF
+
+# OnFailure= はユニット名しか受け取れないため、notifyディスパッチャを包む
+# 汎用テンプレートユニットを置く。使う側は OnFailure=notify@%n.service と書く
+# （個別チャンネル直呼びのnotify-discord@.serviceは廃止。docs/adr/0030）。
+install -m 644 -D /dev/stdin /etc/systemd/system/notify@.service <<'EOF'
 [Unit]
-Description=Discord notification for %i
+Description=Notification for %i
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/notify-discord "%i の実行に失敗しました"
+ExecStart=/usr/local/bin/notify "%i の実行に失敗しました"
 EOF
+rm -f /etc/systemd/system/notify-discord@.service
 systemctl daemon-reload
 
 # 汎用の通知エントリポイント。/etc/m-ino-jp/notify.d/ 配下の実行可能ファイルを
@@ -440,11 +474,19 @@ install -m 750 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.d/
 #!/usr/bin/env bash
 exec /usr/local/bin/notify-discord "$@"
 EOF
+install -m 750 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.d/20-email <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/bin/notify-email "$@"
+EOF
 
 if [[ ! -f /etc/m-ino-jp/notify.env ]]; then
   install -m 640 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.env <<'EOF'
 # Discord の Webhook URL をここに設定する。このファイルはGit管理外。
 DISCORD_WEBHOOK_URL=
+# Brevo Transactional Email API（notify-email用）。docs/66-brevo-service-integration.md 2-4。
+BREVO_API_KEY=
+BREVO_NOTIFY_FROM=notify@send.m-ino.jp
+BREVO_NOTIFY_TO=
 EOF
 else
   # 既存の値は残したまま、権限だけ揃える
