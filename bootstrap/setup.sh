@@ -360,7 +360,11 @@ systemctl restart docker
 usermod -aG docker "${ADMIN_USER}"
 
 # コンテナ間を繋ぐ共有ネットワーク。Caddyと各サービスがここで出会う。
-docker network inspect edge >/dev/null 2>&1 || docker network create edge
+# subnetを固定する理由: stacks/proxy/compose.yamlのCaddyが、ホスト上の
+# webhook（stacks/admin-console）へこのネットワークのゲートウェイIP経由で
+# 到達する（ADR 0016）。サブネットをDocker任せにすると、このネットワークを
+# 作り直したときにゲートウェイIPが変わり、Caddyfile側の設定と食い違う。
+docker network inspect edge >/dev/null 2>&1 || docker network create --subnet=172.20.0.0/24 edge
 
 # ---------------------------------------------------------------------------
 log "11. ディレクトリと通知スクリプト"
@@ -375,8 +379,11 @@ install -d -m 750 -o root -g "${admin_group}" /etc/m-ino-jp
 # Discord Webhook への通知。メールサーバを立てない代わりの仕組み。
 install -m 755 -D /dev/stdin /usr/local/bin/notify-discord <<'EOF'
 #!/usr/bin/env bash
-# 使い方: notify-discord "メッセージ"
+# 使い方: notify-discord [--level=high|low] "メッセージ"
 #   systemd からは notify.d/10-discord 経由（OnFailure=notify@%n.service）で呼ばれる
+#   levelを省略した場合はhigh扱い（既存の呼び出し元との後方互換のため）。
+#   high: DISCORD_MENTION_ID が設定されていればメンション付きで送る
+#   low : メンション無しで送る（気付いたら見る程度の通知向け）
 set -euo pipefail
 
 if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
@@ -390,8 +397,19 @@ if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
   exit 1
 fi
 
+level=high
+if [[ "${1:-}" == --level=* ]]; then
+  level="${1#--level=}"
+  shift
+fi
+
+mention=""
+if [[ "${level}" == "high" && -n "${DISCORD_MENTION_ID:-}" ]]; then
+  mention="<@${DISCORD_MENTION_ID}> "
+fi
+
 message="${1:-(メッセージなし)}"
-payload=$(jq -Rn --arg c "[$(hostname)] ${message}" '{content: $c}')
+payload=$(jq -Rn --arg c "[$(hostname)] ${mention}${message}" '{content: $c}')
 curl -fsS -H 'Content-Type: application/json' -d "${payload}" \
   "${DISCORD_WEBHOOK_URL}" >/dev/null
 EOF
@@ -400,8 +418,20 @@ EOF
 # （docs/adr/0030-notify-email-brevo.md）。
 install -m 755 -D /dev/stdin /usr/local/bin/notify-email <<'EOF'
 #!/usr/bin/env bash
-# 使い方: notify-email "メッセージ"
+# 使い方: notify-email [--level=high|low] "メッセージ"
+#   levelを省略した場合はhigh扱い（既存の呼び出し元との後方互換のため）。
+#   low（気付いたら見る程度の通知）はメール配信そのものをしない（docs/adr/0035）。
 set -euo pipefail
+
+level=high
+if [[ "${1:-}" == --level=* ]]; then
+  level="${1#--level=}"
+  shift
+fi
+
+if [[ "${level}" == "low" ]]; then
+  exit 0
+fi
 
 if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
   echo "notify-email: /etc/m-ino-jp/notify.env が無いか読めない" >&2
@@ -449,10 +479,95 @@ systemctl daemon-reload
 # スクリプトを追加するだけでよく、呼び出し側は変更不要。
 install -m 755 -D /dev/stdin /usr/local/bin/notify <<'EOF'
 #!/usr/bin/env bash
-# 使い方: notify "メッセージ"
+# 使い方: notify [--level=high|low] "メッセージ"
+#   level未指定はhigh（強い通知＝Discordメンション付き＋メール配信あり）。
+#   low（弱い通知＝Discordメンション無し＋メール配信無し。気付いたら見る程度）
+#   levelは各チャンネル(notify.d/*)にそのまま引き渡すだけで、ここでは解釈しない
+#   （docs/adr/0035）。
+#
+# 【フラッド抑制】DiscordのWebhookにもBrevoの送信数にも上限があり、短時間に
+# 大量送信するとレート制限に当たるだけでなく、送信ドメインがスパム扱いされる
+# 恐れがある。通知経路はすべてこのスクリプトを通るので、ここで2段階に絞る
+# （docs/adr/0043）。
+#   1. 同一内容の再送抑制: 同じ level+本文 は DEDUP_WINDOW 秒に1回だけ送る
+#   2. 全体の上限:         RATE_WINDOW 秒あたり RATE_MAX 件で打ち止め
+# どちらも抑制した件数を数えていて、次に実際に送るときの本文へ追記するので、
+# 「何件起きたか」が失われることはない（届くのが遅れるだけ）。
 set -euo pipefail
 
+# 既定値。必要なら呼び出し側が環境変数で上書きできる。
+NOTIFY_DEDUP_WINDOW="${NOTIFY_DEDUP_WINDOW:-1800}"   # 30分
+NOTIFY_RATE_WINDOW="${NOTIFY_RATE_WINDOW:-3600}"     # 1時間
+NOTIFY_RATE_MAX="${NOTIFY_RATE_MAX:-20}"             # 1時間あたり20件
+STATE_DIR=/run/m-ino-jp/notify
+
+level=high
+if [[ "${1:-}" == --level=* ]]; then
+  level="${1#--level=}"
+  shift
+fi
 msg="${1:?メッセージを指定してください}"
+
+now="$(date +%s)"
+extra=""
+
+# 状態ディレクトリが使えない環境（tmpfiles未適用など）では抑制せず素通しする。
+# 「通知が多すぎる」より「必要な通知が届かない」方が危険なので、抑制の仕組みが
+# 壊れているときは抑制しない側へ倒す。
+if [[ -d "${STATE_DIR}" && -w "${STATE_DIR}" ]]; then
+  key="$(printf '%s\n%s' "${level}" "${msg}" | sha256sum | cut -c1-32)"
+  dedup_file="${STATE_DIR}/msg-${key}"
+  rate_file="${STATE_DIR}/rate"
+
+  # --- 1. 同一内容の再送抑制 ---
+  last=0
+  dropped=0
+  if [[ -f "${dedup_file}" ]]; then
+    read -r last dropped < "${dedup_file}" || true
+  fi
+  if (( now - ${last:-0} < NOTIFY_DEDUP_WINDOW )); then
+    dropped=$(( ${dropped:-0} + 1 ))
+    printf '%s %s\n' "${last}" "${dropped}" > "${dedup_file}"
+    echo "notify: 同一内容を${NOTIFY_DEDUP_WINDOW}秒以内に送信済みのため抑制した（この窓で${dropped}件目）" >&2
+    exit 0
+  fi
+  if (( ${dropped:-0} > 0 )); then
+    extra="${extra}"$'\n'"（直前の${NOTIFY_DEDUP_WINDOW}秒間に同じ通知を${dropped}件抑制しました）"
+  fi
+
+  # --- 2. 全体の上限 ---
+  win_start=0
+  sent=0
+  if [[ -f "${rate_file}" ]]; then
+    read -r win_start sent < "${rate_file}" || true
+  fi
+  if (( now - ${win_start:-0} >= NOTIFY_RATE_WINDOW )); then
+    # 窓が明けた。前の窓で打ち止めていた分があれば知らせる。
+    if (( ${sent:-0} > NOTIFY_RATE_MAX )); then
+      extra="${extra}"$'\n'"（前の${NOTIFY_RATE_WINDOW}秒間は上限超過で$(( sent - NOTIFY_RATE_MAX ))件の通知を止めていました）"
+    fi
+    win_start="${now}"
+    sent=0
+  fi
+  sent=$(( ${sent:-0} + 1 ))
+  printf '%s %s\n' "${win_start}" "${sent}" > "${rate_file}"
+
+  if (( sent > NOTIFY_RATE_MAX )); then
+    echo "notify: ${NOTIFY_RATE_WINDOW}秒あたり${NOTIFY_RATE_MAX}件の上限を超えたため抑制した" >&2
+    exit 0
+  fi
+  if (( sent == NOTIFY_RATE_MAX )); then
+    extra="${extra}"$'\n'"（これが${NOTIFY_RATE_WINDOW}秒あたりの上限${NOTIFY_RATE_MAX}件目です。以降この窓が明けるまで通知を止めます）"
+  fi
+
+  # 実際に送るので、同一内容の抑制タイマーを now から測り直す。
+  printf '%s 0\n' "${now}" > "${dedup_file}"
+
+  # 古いdedupファイルの掃除（/runはtmpfsだが、再起動間隔が長いと溜まる）。
+  find "${STATE_DIR}" -maxdepth 1 -name 'msg-*' -type f \
+    -mmin "+$(( (NOTIFY_DEDUP_WINDOW / 60) + 60 ))" -delete 2>/dev/null || true
+fi
+
 shopt -s nullglob
 channels=(/etc/m-ino-jp/notify.d/*)
 
@@ -464,10 +579,21 @@ fi
 status=0
 for channel in "${channels[@]}"; do
   [[ -x "${channel}" ]] || continue
-  "${channel}" "${msg}" || { echo "notify: ${channel} が失敗しました" >&2; status=1; }
+  "${channel}" --level="${level}" "${msg}${extra}" || { echo "notify: ${channel} が失敗しました" >&2; status=1; }
 done
 exit "${status}"
 EOF
+
+# notifyのフラッド抑制が使う状態ディレクトリ（docs/adr/0043）。
+# /run はtmpfsでブートのたびに消えるので、systemd-tmpfilesに作らせる。
+# notifyの呼び出し元はroot（notify@.service）と ino（vuln-scan等、User=ino）の
+# 両方があるため、グループ書き込みを許可する。setgid（2770）にして、どちらが
+# 作ったファイルでも他方から消せるようにしておく。
+install -m 644 -D /dev/stdin /etc/tmpfiles.d/m-ino-jp-notify.conf <<EOF
+d /run/m-ino-jp 0755 root root -
+d /run/m-ino-jp/notify 2770 root ${admin_group} -
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/m-ino-jp-notify.conf
 
 install -d -m 750 -o root -g "${admin_group}" /etc/m-ino-jp/notify.d
 install -m 750 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.d/10-discord <<'EOF'
@@ -483,6 +609,9 @@ if [[ ! -f /etc/m-ino-jp/notify.env ]]; then
   install -m 640 -o root -g "${admin_group}" -D /dev/stdin /etc/m-ino-jp/notify.env <<'EOF'
 # Discord の Webhook URL をここに設定する。このファイルはGit管理外。
 DISCORD_WEBHOOK_URL=
+# 強い通知（notify --level=high、既定）でメンションするDiscordのユーザーID。
+# 未設定でも動く（メンション無しで送るだけ）。docs/adr/0035。
+DISCORD_MENTION_ID=
 # Brevo Transactional Email API（notify-email用）。docs/66-brevo-service-integration.md 2-4。
 BREVO_API_KEY=
 BREVO_NOTIFY_FROM=notify@send.m-ino.jp
