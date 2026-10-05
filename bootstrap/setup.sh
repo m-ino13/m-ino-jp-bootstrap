@@ -12,6 +12,11 @@
 #      raw.githubusercontent.com から認証なしには取得できない。
 #
 # 冪等。何度実行しても同じ結果になる。
+#
+# 稼働中のVPSへ「読み取り専用ユーザー claude」だけを足したいときは、全体を
+# 流し直さず ONLY_CLAUDE_USER=1 を付ける（docs/94-claude-readonly-user.md）:
+#   sudo ONLY_CLAUDE_USER=1 CLAUDE_SSH_PUBLIC_KEY='ssh-ed25519 AAAA...' \
+#        bash /srv/m-ino-jp/bootstrap/setup.sh
 
 set -euo pipefail
 
@@ -25,6 +30,13 @@ ADMIN_USER="${ADMIN_USER:-ino}"
 HOSTNAME_FQDN="${HOSTNAME_FQDN:-m-ino-jp}"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
 SWAP_SIZE_GB="${SWAP_SIZE_GB:-8}"
+
+# Claude Code 用の読み取り専用ユーザー（docs/adr/0057-claude-readonly-user.md）。
+# sudo にも docker グループにも入れない。公開鍵は公開情報なのでここに渡してよい。
+CLAUDE_USER="${CLAUDE_USER:-claude}"
+CLAUDE_SSH_PUBLIC_KEY="${CLAUDE_SSH_PUBLIC_KEY:-}"
+# 1なら claude ユーザーの節だけを実行して終了する（稼働中VPSへの追加用）。
+ONLY_CLAUDE_USER="${ONLY_CLAUDE_USER:-0}"
 
 # ブート直後は cloud-init や自動更新と dpkg のロックが競合する。すぐ諦めずに待つ。
 APT_OPTS=(-o DPkg::Lock::Timeout=300)
@@ -45,6 +57,226 @@ fi
 
 . /etc/os-release
 log "OS: ${PRETTY_NAME}"
+
+print_warnings() {
+  if ((${#WARNINGS[@]} > 0)); then
+    printf '\n=== 警告 (%d件) ===\n' "${#WARNINGS[@]}"
+    printf -- '- %s\n' "${WARNINGS[@]}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Claude Code 用の読み取り専用ユーザー（docs/adr/0057-claude-readonly-user.md）
+# ---------------------------------------------------------------------------
+# 関数にしてあるのは、通しの実行（末尾で呼ぶ）と、稼働中VPSへ足すだけの実行
+# （ONLY_CLAUDE_USER=1）で同じコードを通すため。再構築用のコードを今回の適用で
+# 実機検証できる。
+#
+# 「何ができないか」は権限の不在で担保する。許可リストは持たない。
+#   - sudo グループにも docker グループにも入れない（docker は実質root）
+#   - /srv/m-ino-jp・/srv/data・/etc/m-ino-jp は書けない（所有者が ino / root）
+#   - 暴走でホストを巻き込まないよう、user-<UID>.slice にメモリ・タスクの上限を掛ける
+# 「状況確認」の幅は、adm / systemd-journal グループ（ログの閲覧）と、root が
+# 毎分書き出す docker の状態スナップショット（/run/m-ino-jp/snapshot/）で与える。
+setup_claude_user() {
+  local uid home snap_dir="/run/m-ino-jp/snapshot"
+
+  # 鍵の検証は副作用の前にやる。壊れた値でユーザーだけ作ると半端な状態が残る。
+  if [[ -n "${CLAUDE_SSH_PUBLIC_KEY}" ]]; then
+    if [[ "${CLAUDE_SSH_PUBLIC_KEY}" == *$'\n'* ]] \
+       || ! ssh-keygen -l -f /dev/stdin <<<"${CLAUDE_SSH_PUBLIC_KEY}" >/dev/null 2>&1; then
+      echo "CLAUDE_SSH_PUBLIC_KEY が公開鍵1行として読めない" >&2
+      exit 1
+    fi
+  fi
+
+  log "claude 1. ユーザー ${CLAUDE_USER}"
+  if ! id -u "${CLAUDE_USER}" >/dev/null 2>&1; then
+    adduser --disabled-password --gecos "" "${CLAUDE_USER}"
+  fi
+  # 他のグループから外す処理は、誰かが手で足した場合の回復用（冪等性のため）。
+  # 既に外れていれば deluser は失敗するので無視する。
+  for g in sudo docker lxd; do
+    deluser "${CLAUDE_USER}" "${g}" >/dev/null 2>&1 || true
+  done
+  # adm: /var/log の閲覧。systemd-journal: journalctl の全ユニット閲覧。
+  usermod -aG adm,systemd-journal "${CLAUDE_USER}"
+
+  uid="$(id -u "${CLAUDE_USER}")"
+  home="$(getent passwd "${CLAUDE_USER}" | cut -d: -f6)"
+
+  log "claude 2. SSH公開鍵"
+  if [[ -n "${CLAUDE_SSH_PUBLIC_KEY}" ]]; then
+    install -d -m 700 -o "${CLAUDE_USER}" -g "${CLAUDE_USER}" "${home}/.ssh"
+    # restrict は pty・各種転送・~/.ssh/rc を一括で禁じる。pty だけ戻すのは、
+    # 人間が入って調べるときに対話シェルが使えないと不便なため。
+    install -m 600 -o "${CLAUDE_USER}" -g "${CLAUDE_USER}" /dev/stdin \
+      "${home}/.ssh/authorized_keys" <<EOF
+restrict,pty ${CLAUDE_SSH_PUBLIC_KEY}
+EOF
+    echo "公開鍵を ${home}/.ssh/authorized_keys に配置した"
+  else
+    warn "CLAUDE_SSH_PUBLIC_KEY が空。${CLAUDE_USER} は作ったが、SSHでは入れない"
+  fi
+
+  log "claude 3. sshd の AllowUsers"
+  # 01-hardening.conf が無いのは、鍵が無くてハードニングを見送ったとき。その状態で
+  # AllowUsers を足すと、claude 以外（ino）を締め出す側に倒れるので足さない。
+  # AllowUsers は複数行・複数ファイルで累積する（先勝ちではない）ため、01 を
+  # 書き換えずに別ファイルで足せる。効いたかは最後に実効値で確認する。
+  if [[ -f /etc/ssh/sshd_config.d/01-hardening.conf ]]; then
+    local claude_conf=/etc/ssh/sshd_config.d/02-claude-user.conf
+    install -m 644 -D /dev/stdin "${claude_conf}" <<EOF
+AllowUsers ${CLAUDE_USER}
+EOF
+    install -d -m 0755 -o root -g root /run/sshd
+    if ! sshd -t; then
+      rm -f "${claude_conf}"
+      echo "sshd の設定が不正だったため、${claude_conf} を取り消した" >&2
+      exit 1
+    fi
+    # ssh.socket による socket activation なら接続のたびに設定を読み直す
+    # ので reload は不要（5節と同じ事情）。
+    if ! systemctl is-active --quiet ssh.socket; then
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null \
+        || warn "sshd の reload に失敗した。手動で確認すること"
+    fi
+    echo "--- sshd の実効 AllowUsers ---"
+    sshd -T | grep -i '^allowusers' || true
+    echo "------------------------------"
+    sshd -T | grep -i '^allowusers' | grep -qw "${CLAUDE_USER}" \
+      || warn "sshd の実効設定に ${CLAUDE_USER} が入っていない。AllowUsers が累積しない版かもしれない。01-hardening.conf を直接直すこと"
+  else
+    warn "01-hardening.conf が無いので AllowUsers は触っていない"
+  fi
+
+  log "claude 4. 資源の上限"
+  # 2GBのホストで、ログインユーザーの暴走（grep -r、fork爆弾など）が常駐サービスを
+  # OOMや swap 嵐に巻き込むのを防ぐ。swap を禁じるのは、8GBのswapファイルを
+  # このユーザーに食い潰させないため。UID は adduser 任せで再構築のたびに変わりうる
+  # ので、ここで引いた実値からファイル名を作る。
+  install -m 644 -D /dev/stdin "/etc/systemd/system/user-${uid}.slice.d/99-m-ino-jp.conf" <<'EOF'
+[Slice]
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=200
+CPUQuota=100%
+EOF
+  systemctl daemon-reload
+
+  log "claude 5. docker 状態スナップショット"
+  if command -v docker >/dev/null 2>&1; then
+    # claude に docker.sock を渡さない代わりに、root が読み取り結果だけを書き出す。
+    # docker inspect は環境変数（=秘密）を含むので出さない。
+    install -m 755 -D /dev/stdin /usr/local/bin/vps-snapshot <<'EOF'
+#!/usr/bin/env bash
+# 使い方: vps-snapshot   （systemd の vps-snapshot.timer から毎分、root で呼ばれる）
+# docker の状態を /run/m-ino-jp/snapshot/*.txt に書く。読むのは claude ユーザー。
+set -euo pipefail
+dir=/run/m-ino-jp/snapshot
+install -d -m 755 "${dir}"
+out() {  # out <ファイル名> <コマンド...>: 一時ファイル経由で置き換え、読み手が途中を見ないようにする
+  local f="${dir}/$1"; shift
+  { date '+# %F %T %Z'; "$@"; } > "${f}.tmp" 2>&1 || true
+  chmod 644 "${f}.tmp"; mv "${f}.tmp" "${f}"
+}
+cgroup_mem() {  # コンテナごとの RSS / swap / 上限（.claude/rules/compose.md の手順と同じ値）
+  local name id d
+  while read -r name id; do
+    d="/sys/fs/cgroup/system.slice/docker-${id}.scope"
+    [[ -d "${d}" ]] || continue
+    printf '%s\n' "${name#/}"
+    for k in memory.current memory.swap.current memory.max memory.swap.max memory.peak; do
+      printf '  %s=%s\n' "${k}" "$(cat "${d}/${k}")"
+    done
+    sed 's/^/  /' "${d}/memory.events"
+  done < <(docker inspect -f '{{.Name}} {{.Id}}' $(docker ps -q))
+}
+out containers.txt docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.RunningFor}}'
+out stats.txt docker stats --no-stream
+out memory-cgroup.txt cgroup_mem
+out disk.txt docker system df
+EOF
+
+    install -m 644 -D /dev/stdin /etc/systemd/system/vps-snapshot.service <<'EOF'
+[Unit]
+Description=Write a read-only snapshot of docker state for the claude user
+After=docker.service
+
+[Service]
+Type=oneshot
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/vps-snapshot
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=64M
+TimeoutStartSec=1m
+# OnFailure=notify@%n.service は付けない。毎分走るので、docker の一時的な不調が
+# そのまま通知のフラッドになる（ADR 0043）。止まれば各ファイル先頭の日時が古く
+# なるので、読み手（claude）がそれで気付く。
+EOF
+    install -m 644 -D /dev/stdin /etc/systemd/system/vps-snapshot.timer <<'EOF'
+[Unit]
+Description=Refresh the docker state snapshot every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now vps-snapshot.timer
+    systemctl start vps-snapshot.service
+    ls -l "${snap_dir}"
+  else
+    warn "docker が未導入のためスナップショットを入れていない。docker 導入後に ONLY_CLAUDE_USER=1 で再実行すること"
+  fi
+
+  log "claude 6. 権限の確認"
+  # 構成が崩れていたら、ここで落とす。「読み取り専用」が嘘のまま残るのが一番まずい。
+  if id -nG "${CLAUDE_USER}" | tr ' ' '\n' | grep -Eqx 'sudo|docker|lxd|root'; then
+    echo "${CLAUDE_USER} が特権グループに入っている: $(id -nG "${CLAUDE_USER}")" >&2
+    exit 1
+  fi
+  echo "所属グループ: $(id -nG "${CLAUDE_USER}")"
+
+  # 読めてはいけないものが読めていないか。見つけても自動では chmod しない
+  # （どう塞ぐかはサービスごとの判断で、勝手に変えるとコンテナが読めなくなる）。
+  # 警告として残し、人間が対処する。
+  local exposed=()
+  while IFS= read -r f; do
+    exposed+=("${f}")
+  done < <(runuser -u "${CLAUDE_USER}" -- bash -c '
+    shopt -s nullglob
+    for f in /etc/m-ino-jp/*.env /srv/m-ino-jp/stacks/*/.env /srv/m-ino-jp/stacks/*/*.env \
+             /srv/data/zitadel/pat/* /srv/data/*/.env; do
+      [[ -f "$f" && -r "$f" ]] && echo "$f"
+    done; true')
+  if ((${#exposed[@]} > 0)); then
+    warn "claude から秘密情報らしきファイルが読める: ${exposed[*]}"
+  else
+    echo "既知の秘密情報の置き場所は claude から読めない"
+  fi
+
+  # 永続データ（DB・アップロードファイル）も「状況確認」の範囲ではない。
+  # 件数と先頭だけ出す。0件でなければ、中身を見て塞ぐか許容するかを人間が決める。
+  local data_readable
+  data_readable="$(runuser -u "${CLAUDE_USER}" -- find /srv/data -xdev -type f -readable 2>/dev/null | head -n 20 || true)"
+  if [[ -n "${data_readable}" ]]; then
+    warn "claude から /srv/data 配下のファイルが読める（先頭20件）: $(tr '\n' ' ' <<<"${data_readable}")"
+  else
+    echo "/srv/data 配下に claude から読めるファイルは無い"
+  fi
+}
+
+if [[ "${ONLY_CLAUDE_USER}" == "1" ]]; then
+  setup_claude_user
+  log "完了（ONLY_CLAUDE_USER=1: claude ユーザーの節のみ）"
+  print_warnings
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 log "1. ホスト名とタイムゾーン"
@@ -624,6 +856,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+log "12. Claude Code 用の読み取り専用ユーザー"
+# ---------------------------------------------------------------------------
+# sshd のハードニング(5)と docker(10)の後で呼ぶ。AllowUsers を足す相手の
+# 01-hardening.conf と、スナップショットが叩く docker が揃っている必要がある。
+setup_claude_user
+
+# ---------------------------------------------------------------------------
 log "完了"
 # ---------------------------------------------------------------------------
 cat <<EOF
@@ -655,7 +894,4 @@ free -h
 echo
 ufw status verbose
 
-if ((${#WARNINGS[@]} > 0)); then
-  printf '\n=== 警告 (%d件) ===\n' "${#WARNINGS[@]}"
-  printf -- '- %s\n' "${WARNINGS[@]}"
-fi
+print_warnings
