@@ -58,6 +58,21 @@ fi
 . /etc/os-release
 log "OS: ${PRETTY_NAME}"
 
+# sshd の設定（drop-in）を、稼働中の sshd に反映する。
+# Ubuntu 24.04 の ssh.socket は「最初の接続で ssh.service を起動する」だけで、起動した
+# sshd は常駐し続ける。接続のたびに設定を読み直すわけではないので、稼働中なら reload
+# しないと drop-in が効かない（reload は既存セッションを切らない）。未起動なら、
+# 起動時に新しい設定が読まれるので何もしなくてよい。
+reload_sshd() {
+  if systemctl is-active --quiet ssh.service || systemctl is-active --quiet sshd.service; then
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null \
+      || warn "sshd の reload に失敗した。手動で確認すること（sudo systemctl reload ssh）"
+    echo "sshd を reload した"
+  else
+    echo "ssh.service は未起動（socket activation で初回接続待ち）。起動時に新しい設定が読まれる"
+  fi
+}
+
 print_warnings() {
   if ((${#WARNINGS[@]} > 0)); then
     printf '\n=== 警告 (%d件) ===\n' "${#WARNINGS[@]}"
@@ -105,6 +120,17 @@ setup_claude_user() {
   uid="$(id -u "${CLAUDE_USER}")"
   home="$(getent passwd "${CLAUDE_USER}" | cut -d: -f6)"
 
+  # リポジトリ（/srv/m-ino-jp）は ino の所有なので、claude が git を使うと
+  # "dubious ownership" で拒否される。claude 自身の ~/.gitconfig に、このパスだけを
+  # 許可する（'*' にはしない）。権限昇格にはならない: claude はリポジトリに書けず、
+  # ino 所有の設定が下位の claude 権限で読まれる向き。VPS が取り込み済みのコミットと、
+  # サーバ上の直接編集（git status）を claude が確認できるようにするため。
+  # --replace-all なので何度流しても1行のまま（冪等）。
+  if command -v git >/dev/null 2>&1; then
+    runuser -u "${CLAUDE_USER}" -- env HOME="${home}" \
+      git config --global --replace-all safe.directory /srv/m-ino-jp
+  fi
+
   log "claude 2. SSH公開鍵"
   if [[ -n "${CLAUDE_SSH_PUBLIC_KEY}" ]]; then
     install -d -m 700 -o "${CLAUDE_USER}" -g "${CLAUDE_USER}" "${home}/.ssh"
@@ -135,12 +161,7 @@ EOF
       echo "sshd の設定が不正だったため、${claude_conf} を取り消した" >&2
       exit 1
     fi
-    # ssh.socket による socket activation なら接続のたびに設定を読み直す
-    # ので reload は不要（5節と同じ事情）。
-    if ! systemctl is-active --quiet ssh.socket; then
-      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null \
-        || warn "sshd の reload に失敗した。手動で確認すること"
-    fi
+    reload_sshd
     echo "--- sshd の実効 AllowUsers ---"
     sshd -T | grep -i '^allowusers' || true
     echo "------------------------------"
@@ -430,14 +451,9 @@ EOF
     exit 1
   fi
 
-  # Ubuntu 24.04 は既定で ssh.socket による socket activation。
-  # その場合 ssh.service は動いていないので reload は失敗するが、
-  # 接続のたびに sshd が起動して設定を読み直すため reload 自体が不要。
-  if systemctl is-active --quiet ssh.socket; then
-    echo "ssh.socket による socket activation。次の接続から新しい設定が使われる"
-  elif ! systemctl reload ssh 2>/dev/null; then
-    systemctl reload sshd 2>/dev/null || warn "sshd の reload に失敗した。手動で確認すること"
-  fi
+  # 初回の通し実行では ssh.service はまだ起動していないので reload は走らない。
+  # 稼働中のVPSでこの節を流し直したときは reload が効く（reload_sshd の説明を参照）。
+  reload_sshd
 
   # drop-in の優先順位を間違えると設定が黙って無視されるため、実効値を出す。
   echo "--- sshd の実効設定 ---"
@@ -602,7 +618,12 @@ docker network inspect edge >/dev/null 2>&1 || docker network create --subnet=17
 log "11. ディレクトリと通知スクリプト"
 # ---------------------------------------------------------------------------
 install -d -m 755 -o "${ADMIN_USER}" -g "${admin_group}" /srv/m-ino-jp
-install -d -m 755 -o "${ADMIN_USER}" -g "${admin_group}" /srv/data
+# /srv/data は 750。読み取り専用ユーザー claude（${admin_group} グループの外）から
+# 永続データ（DB・Nextcloud のファイル・CouchDB の Vault）を見せないため。親を閉じれば
+# 配下を1つずつ chmod せずに済み、コンテナ内ユーザーの権限にも触らない（bind mount は
+# dockerd=root が親パスをたどるので、コンテナには影響しない。docs/94、ADR 0057）。
+# /srv/m-ino-jp は 755 のまま（リポジトリは claude にも読ませる）。.env は 600。
+install -d -m 750 -o "${ADMIN_USER}" -g "${admin_group}" /srv/data
 
 # 書き込みはrootだけ、読み取りは管理ユーザーにも許す。
 # notify-discord を ino がそのまま実行できるようにするため。
