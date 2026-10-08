@@ -17,6 +17,10 @@
 # 流し直さず ONLY_CLAUDE_USER=1 を付ける（docs/94-claude-readonly-user.md）:
 #   sudo ONLY_CLAUDE_USER=1 CLAUDE_SSH_PUBLIC_KEY='ssh-ed25519 AAAA...' \
 #        bash /srv/m-ino-jp/bootstrap/setup.sh
+#
+# 同じく、通知の送信スクリプト（notify-discord / notify-email）だけを入れ直したい
+# ときは ONLY_NOTIFY=1（docs/95-process-argv-hardening.md 手順4）:
+#   sudo ONLY_NOTIFY=1 bash /srv/m-ino-jp/bootstrap/setup.sh
 
 set -euo pipefail
 
@@ -37,6 +41,8 @@ CLAUDE_USER="${CLAUDE_USER:-claude}"
 CLAUDE_SSH_PUBLIC_KEY="${CLAUDE_SSH_PUBLIC_KEY:-}"
 # 1なら claude ユーザーの節だけを実行して終了する（稼働中VPSへの追加用）。
 ONLY_CLAUDE_USER="${ONLY_CLAUDE_USER:-0}"
+# 1なら notify-discord / notify-email の配置だけを実行して終了する（稼働中VPSへの入れ直し用）。
+ONLY_NOTIFY="${ONLY_NOTIFY:-0}"
 
 # ブート直後は cloud-init や自動更新と dpkg のロックが競合する。すぐ諦めずに待つ。
 APT_OPTS=(-o DPkg::Lock::Timeout=300)
@@ -292,10 +298,113 @@ EOF
   fi
 }
 
+# ---------------------------------------------------------------------------
+# 通知の送信スクリプト（notify-discord / notify-email）
+# ---------------------------------------------------------------------------
+# 関数にしてあるのは、通しの実行（11節で呼ぶ）と、稼働中VPSへ入れ直すだけの実行
+# （ONLY_NOTIFY=1）で同じコードを通すため。通しで流すと ufw --force reset などを
+# 含むので、稼働中のVPSでは流せない。
+#
+# Webhook URL・APIキーは curl の引数に載せない。引数は /proc/<pid>/cmdline から
+# 他のユーザー（claude）にも見える（docs/adr/0059）。printf は bash の組み込みなので
+# 引数にならず、プロセス置換で curl へ渡る（.claude/rules/shell.md「秘密情報」）。
+setup_notify_senders() {
+  # Discord Webhook への通知。メールサーバを立てない代わりの仕組み。
+  install -m 755 -D /dev/stdin /usr/local/bin/notify-discord <<'EOF'
+#!/usr/bin/env bash
+# 使い方: notify-discord [--level=high|low] "メッセージ"
+#   systemd からは notify.d/10-discord 経由（OnFailure=notify@%n.service）で呼ばれる
+#   levelを省略した場合はhigh扱い（既存の呼び出し元との後方互換のため）。
+#   high: DISCORD_MENTION_ID が設定されていればメンション付きで送る
+#   low : メンション無しで送る（気付いたら見る程度の通知向け）
+set -euo pipefail
+
+if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
+  echo "notify-discord: /etc/m-ino-jp/notify.env が無いか読めない" >&2
+  exit 1
+fi
+. /etc/m-ino-jp/notify.env
+
+if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
+  echo "notify-discord: DISCORD_WEBHOOK_URL が未設定" >&2
+  exit 1
+fi
+
+level=high
+if [[ "${1:-}" == --level=* ]]; then
+  level="${1#--level=}"
+  shift
+fi
+
+mention=""
+if [[ "${level}" == "high" && -n "${DISCORD_MENTION_ID:-}" ]]; then
+  mention="<@${DISCORD_MENTION_ID}> "
+fi
+
+message="${1:-(メッセージなし)}"
+payload=$(jq -Rn --arg c "[$(hostname)] ${mention}${message}" '{content: $c}')
+# Webhook URLは秘密（知っていれば誰でも投稿できる）。引数に載せず -K で渡す。
+# Webhook URLに " と \ は含まれないので、設定ファイルの引用符で囲んでよい。
+curl -fsS -H 'Content-Type: application/json' -d "${payload}" \
+  -K <(printf 'url = "%s"\n' "${DISCORD_WEBHOOK_URL}") >/dev/null
+EOF
+
+  # Brevo Transactional Email API への通知。notify-discordと対称的な構成
+  # （docs/adr/0030-notify-email-brevo.md）。
+  install -m 755 -D /dev/stdin /usr/local/bin/notify-email <<'EOF'
+#!/usr/bin/env bash
+# 使い方: notify-email [--level=high|low] "メッセージ"
+#   levelを省略した場合はhigh扱い（既存の呼び出し元との後方互換のため）。
+#   low（気付いたら見る程度の通知）はメール配信そのものをしない（docs/adr/0035）。
+set -euo pipefail
+
+level=high
+if [[ "${1:-}" == --level=* ]]; then
+  level="${1#--level=}"
+  shift
+fi
+
+if [[ "${level}" == "low" ]]; then
+  exit 0
+fi
+
+if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
+  echo "notify-email: /etc/m-ino-jp/notify.env が無いか読めない" >&2
+  exit 1
+fi
+. /etc/m-ino-jp/notify.env
+
+if [[ -z "${BREVO_API_KEY:-}" || -z "${BREVO_NOTIFY_FROM:-}" || -z "${BREVO_NOTIFY_TO:-}" ]]; then
+  echo "notify-email: BREVO_API_KEY / BREVO_NOTIFY_FROM / BREVO_NOTIFY_TO が未設定" >&2
+  exit 1
+fi
+
+message="${1:-(メッセージなし)}"
+payload=$(jq -n \
+  --arg from "${BREVO_NOTIFY_FROM}" \
+  --arg to "${BREVO_NOTIFY_TO}" \
+  --arg subj "[$(hostname)] m-ino.jp 通知" \
+  --arg text "${message}" \
+  '{sender:{email:$from}, to:[{email:$to}], subject:$subj, textContent:$text}')
+
+# APIキーは引数に載せず、ヘッダをプロセス置換のファイルとして渡す。
+curl -fsS -X POST "https://api.brevo.com/v3/smtp/email" \
+  -H @<(printf 'api-key: %s' "${BREVO_API_KEY}") \
+  -H "Content-Type: application/json" \
+  -d "${payload}" >/dev/null
+EOF
+}
+
 if [[ "${ONLY_CLAUDE_USER}" == "1" ]]; then
   setup_claude_user
   log "完了（ONLY_CLAUDE_USER=1: claude ユーザーの節のみ）"
   print_warnings
+  exit 0
+fi
+
+if [[ "${ONLY_NOTIFY}" == "1" ]]; then
+  setup_notify_senders
+  log "完了（ONLY_NOTIFY=1: notify-discord / notify-email のみ）"
   exit 0
 fi
 
@@ -629,87 +738,8 @@ install -d -m 750 -o "${ADMIN_USER}" -g "${admin_group}" /srv/data
 # notify-discord を ino がそのまま実行できるようにするため。
 install -d -m 750 -o root -g "${admin_group}" /etc/m-ino-jp
 
-# Discord Webhook への通知。メールサーバを立てない代わりの仕組み。
-install -m 755 -D /dev/stdin /usr/local/bin/notify-discord <<'EOF'
-#!/usr/bin/env bash
-# 使い方: notify-discord [--level=high|low] "メッセージ"
-#   systemd からは notify.d/10-discord 経由（OnFailure=notify@%n.service）で呼ばれる
-#   levelを省略した場合はhigh扱い（既存の呼び出し元との後方互換のため）。
-#   high: DISCORD_MENTION_ID が設定されていればメンション付きで送る
-#   low : メンション無しで送る（気付いたら見る程度の通知向け）
-set -euo pipefail
-
-if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
-  echo "notify-discord: /etc/m-ino-jp/notify.env が無いか読めない" >&2
-  exit 1
-fi
-. /etc/m-ino-jp/notify.env
-
-if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
-  echo "notify-discord: DISCORD_WEBHOOK_URL が未設定" >&2
-  exit 1
-fi
-
-level=high
-if [[ "${1:-}" == --level=* ]]; then
-  level="${1#--level=}"
-  shift
-fi
-
-mention=""
-if [[ "${level}" == "high" && -n "${DISCORD_MENTION_ID:-}" ]]; then
-  mention="<@${DISCORD_MENTION_ID}> "
-fi
-
-message="${1:-(メッセージなし)}"
-payload=$(jq -Rn --arg c "[$(hostname)] ${mention}${message}" '{content: $c}')
-curl -fsS -H 'Content-Type: application/json' -d "${payload}" \
-  "${DISCORD_WEBHOOK_URL}" >/dev/null
-EOF
-
-# Brevo Transactional Email API への通知。notify-discordと対称的な構成
-# （docs/adr/0030-notify-email-brevo.md）。
-install -m 755 -D /dev/stdin /usr/local/bin/notify-email <<'EOF'
-#!/usr/bin/env bash
-# 使い方: notify-email [--level=high|low] "メッセージ"
-#   levelを省略した場合はhigh扱い（既存の呼び出し元との後方互換のため）。
-#   low（気付いたら見る程度の通知）はメール配信そのものをしない（docs/adr/0035）。
-set -euo pipefail
-
-level=high
-if [[ "${1:-}" == --level=* ]]; then
-  level="${1#--level=}"
-  shift
-fi
-
-if [[ "${level}" == "low" ]]; then
-  exit 0
-fi
-
-if [[ ! -r /etc/m-ino-jp/notify.env ]]; then
-  echo "notify-email: /etc/m-ino-jp/notify.env が無いか読めない" >&2
-  exit 1
-fi
-. /etc/m-ino-jp/notify.env
-
-if [[ -z "${BREVO_API_KEY:-}" || -z "${BREVO_NOTIFY_FROM:-}" || -z "${BREVO_NOTIFY_TO:-}" ]]; then
-  echo "notify-email: BREVO_API_KEY / BREVO_NOTIFY_FROM / BREVO_NOTIFY_TO が未設定" >&2
-  exit 1
-fi
-
-message="${1:-(メッセージなし)}"
-payload=$(jq -n \
-  --arg from "${BREVO_NOTIFY_FROM}" \
-  --arg to "${BREVO_NOTIFY_TO}" \
-  --arg subj "[$(hostname)] m-ino.jp 通知" \
-  --arg text "${message}" \
-  '{sender:{email:$from}, to:[{email:$to}], subject:$subj, textContent:$text}')
-
-curl -fsS -X POST "https://api.brevo.com/v3/smtp/email" \
-  -H "api-key: ${BREVO_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d "${payload}" >/dev/null
-EOF
+log "notify-discord / notify-email を配置"
+setup_notify_senders
 
 # OnFailure= はユニット名しか受け取れないため、notifyディスパッチャを包む
 # 汎用テンプレートユニットを置く。使う側は OnFailure=notify@%n.service と書く
