@@ -39,10 +39,10 @@ git push
 | 変数 | 役割 |
 |---|---|
 | `SSH_PUBLIC_KEY` | 管理ユーザー `ino` の `authorized_keys` に入れる鍵（複数行可）。**上書きなので、書いていない鍵は消える** |
-| `CLAUDE_SSH_PUBLIC_KEY` | Claude Code 用の読み取り専用ユーザー `claude` の鍵（1行）。`sudo` も `docker` グループも持たず、`restrict,pty` 付きで登録される。空だと `claude` は作られるがSSHでは入れない |
+| `CLAUDE_SSH_PUBLIC_KEY` | Claude Code 用の読み取り専用ユーザー `claude` の鍵（1行）。`sudo` も `docker` グループも持たず、`restrict,pty` 付きで、root 所有の `authorized_keys` に登録される（本人は書き換えられない）。空だと `claude` は作られるがSSHでは入れない。`CLAUDE_USER` が `ino`・`root` と同じ、UID 1000未満、パスワード設定済み（`passwd -S` が `P`）のときは、副作用の前に中止する（ADR 0060） |
 | `ONLY_CLAUDE_USER=1` | `claude` ユーザーの節だけを実行して終了する。**稼働中のVPSに `claude` を後から追加する**ときに付ける（ufw・Docker・`ino` の鍵には触らない）。手順は `docs/94-claude-readonly-user.md`、設計は `docs/adr/0057-claude-readonly-user.md` |
 
-`claude` の節は `sshd` の drop-in（`02-claude-user.conf`）と `/srv/data` の権限（750）を触るため、稼働中に流すときは `CLAUDE.md` の最重要ルール2（別セッションを開いたまま、新規セッションの疎通確認が取れるまで閉じない）に従う。
+`claude` の節は `sshd` の drop-in（`02-claude-user.conf`）、`/srv/data` の権限（750）、`claude` のホームの所有者、`/etc/cron.allow`、polkit のルール、logind の drop-in（変更時は `systemd-logind` を再起動する）、apport の mask を触るため（ADR 0060）、稼働中に流すときは `CLAUDE.md` の最重要ルール2（別セッションを開いたまま、新規セッションの疎通確認が取れるまで閉じない）に従う。
 
 ## 初回セットアップ（公開用リポジトリを作る）
 

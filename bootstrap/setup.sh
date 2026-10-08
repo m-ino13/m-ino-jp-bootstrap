@@ -87,6 +87,199 @@ print_warnings() {
 }
 
 # ---------------------------------------------------------------------------
+# needrestart の drop-in（自動再起動 + インタプリタのスキャン無効化）
+# ---------------------------------------------------------------------------
+# 通しの実行（8節）と setup_claude_user（ONLY_CLAUDE_USER=1 では8節が流れない）の
+# 両方から呼ぶ。drop-in は全文を書き直す（追記ではない）ので、行を足すときはここに足す。
+#   restart = 'a'      : 対話プロンプトを出すと自動更新が止まるので、自動再起動にする
+#   interpscan = 0     : 他ユーザーが置いたスクリプトを needrestart が解釈実行しない
+#                        ようにする（docs/adr/0060 決定5。needrestart の過去のCVEは
+#                        この経路だった。導入済みの版は修正済みだが、使わない機能は切る）
+write_needrestart_conf() {
+  install -m 644 -D /dev/stdin /etc/needrestart/conf.d/99-m-ino-jp.conf <<'EOF'
+$nrconf{restart} = 'a';
+$nrconf{interpscan} = 0;
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# claude ユーザーの封じ込め（docs/adr/0060-claude-containment.md）
+# ---------------------------------------------------------------------------
+# ADR 0057 は「ファイル権限」で読み取り専用を担保した。ここはそれ以外（居座り・
+# 鍵の書き換え・ネットワーク・資源）を塞ぐ関数群で、すべて setup_claude_user から
+# 呼ばれる。claude の鍵が漏れた場合の被害を、攻撃者が claude を名乗って入れる範囲
+# （状況確認だけ）に閉じ込めるのが目的。
+
+# 副作用の前に、CLAUDE_USER が「作ってよい／触ってよいユーザー」かを確かめる。
+# 変数の打ち間違いで ino や root を指すと、setup_claude_user は sudo・docker の
+# グループから外し、authorized_keys を上書きしてしまう（ADR 0060 決定4）。
+guard_claude_user() {
+  if [[ "${CLAUDE_USER}" == "${ADMIN_USER}" || "${CLAUDE_USER}" == root ]]; then
+    echo "CLAUDE_USER=${CLAUDE_USER} は管理ユーザー（${ADMIN_USER}）または root と同じ。中止する" >&2
+    exit 1
+  fi
+  if id -u "${CLAUDE_USER}" >/dev/null 2>&1; then
+    local u status
+    u="$(id -u "${CLAUDE_USER}")"
+    if ((u < 1000)); then
+      echo "${CLAUDE_USER} の UID が ${u}（1000未満。システムユーザー）。中止する" >&2
+      exit 1
+    fi
+    # P はパスワードが設定されている状態。claude は --disabled-password で作るので L になる。
+    # P なら、人間が使っているアカウントを指している可能性が高い。
+    status="$(passwd -S "${CLAUDE_USER}" | awk '{print $2}')"
+    if [[ "${status}" == P ]]; then
+      echo "${CLAUDE_USER} にはパスワードが設定されている（passwd -S: P）。人間のアカウントの可能性があるので中止する" >&2
+      exit 1
+    fi
+  fi
+}
+
+# claude のホームを root の所有にする（ADR 0060 決定3）。claude 自身が authorized_keys や
+# .bashrc を書き換えて、restrict を外したり鍵を足したり、次のログインで何かを走らせたり
+# できないようにする。鍵の変数が空のときも毎回流す（所有者の是正は鍵の有無と無関係）。
+#
+# 順序に意味がある。root が claude 所有のディレクトリの中で操作すると、claude が
+# シンボリックリンクに差し替えて root に任意のファイルを書かせられる。そのため、
+# (1)ホーム自体 → (2)直下のエントリ → (3)それより深い所、の順に root へ移す。
+# (2)の後は、直下のディレクトリ（.ssh 等）の中のエントリを claude が差し替えられない。
+lock_claude_home() {
+  local home="$1"
+  if [[ ! "${home}" =~ ^/home/[^/]+$ || ! -d "${home}" ]]; then
+    echo "claude のホームが想定外のパス: '${home}'（/home/<名前> のはず）" >&2
+    exit 1
+  fi
+  chown root:"${CLAUDE_USER}" "${home}"
+  chmod 750 "${home}"
+  # ~/.cache は claude が書ける場所として残っていたもの。使わせないので消す。
+  rm -rf "${home:?}/.cache"
+  find "${home}" -mindepth 1 -maxdepth 1 -exec chown -h root:root {} +
+  # 居座りの足場になるのでシンボリックリンクは持たせない。
+  find "${home}" -xdev -type l -delete
+  find "${home}" -xdev -mindepth 2 -exec chown -h root:root {} +
+  find "${home}" -xdev ! -type l -exec chmod go-w {} +
+
+  # root の所有にしただけでは、claude が過去に仕込んだ中身がそのまま残る。
+  # ログイン時に読まれるファイルは /etc/skel から入れ直し、読まれうる他の名前は消す。
+  local f
+  for f in .bashrc .profile .bash_logout; do
+    if [[ -f "/etc/skel/${f}" ]]; then
+      install -m 644 -o root -g root "/etc/skel/${f}" "${home}/${f}"
+    else
+      rm -f "${home:?}/${f}"
+    fi
+  done
+  rm -f "${home:?}/.bash_profile" "${home:?}/.bash_login" "${home:?}/.pam_environment"
+
+  # ~/.ssh: authorized_keys 以外は消す（authorized_keys2 など、sshd が読みうる別名を
+  # 過去に置かれていても残さない）。sshd の StrictModes は root 所有を受け付ける。
+  if [[ -d "${home}/.ssh" ]]; then
+    chmod 755 "${home}/.ssh"
+    find "${home}/.ssh" -mindepth 1 ! -name authorized_keys -delete
+    if [[ -f "${home}/.ssh/authorized_keys" ]]; then
+      chmod 644 "${home}/.ssh/authorized_keys"
+    fi
+  fi
+
+  # リポジトリ（/srv/m-ino-jp）は ino の所有なので、claude が git を使うと
+  # "dubious ownership" で拒否される。~/.gitconfig に、このパスだけを許可する
+  # （'*' にはしない）。権限昇格にはならない: claude はリポジトリに書けず、
+  # ino 所有の設定が下位の claude 権限で読まれる向き。VPS が取り込み済みのコミットと、
+  # サーバ上の直接編集（git status）を claude が確認できるようにするため。
+  # root が書く（claude は書き換えられない）。作り直すので何度流しても1行のまま（冪等）。
+  if command -v git >/dev/null 2>&1; then
+    rm -f "${home:?}/.gitconfig"
+    git config --file "${home}/.gitconfig" --replace-all safe.directory /srv/m-ino-jp
+    chown root:root "${home}/.gitconfig"
+    chmod 644 "${home}/.gitconfig"
+  fi
+}
+
+# crontab を ino と root だけにする（ADR 0060 決定2）。cron のジョブは pam_systemd を
+# 通らず cron.service（上限なし）で動くので、user-<UID>.slice の上限を外れる。
+# /etc/cron.allow があると、載っていないユーザーの crontab は動かなくなる。
+# 他のユーザーの crontab を巻き込まないよう、先に /var/spool/cron/crontabs を確かめる。
+setup_cron_allow() {
+  local spool=/var/spool/cron/crontabs f u others=()
+  if [[ -d "${spool}" ]]; then
+    for f in "${spool}"/*; do
+      [[ -e "${f}" ]] || continue
+      u="${f##*/}"
+      case "${u}" in
+        root|"${ADMIN_USER}") ;;
+        "${CLAUDE_USER}")
+          warn "${CLAUDE_USER} の crontab が存在する（${f}）。居座りの跡かもしれない。docs/94 の「鍵が漏れたとき」で確認すること（cron.allow に載せないので動かなくなる）" ;;
+        *) others+=("${u}") ;;
+      esac
+    done
+  fi
+  if ((${#others[@]} > 0)); then
+    # 載せずに置くと、そのユーザーの crontab が黙って止まる。人間が判断する。
+    warn "${others[*]} の crontab がある。/etc/cron.allow は作らなかった（作ると止まる）。載せるなら ADMIN_USER 以外を足してから再実行すること"
+    return 0
+  fi
+  install -m 644 -D /dev/stdin /etc/cron.allow <<EOF
+root
+${ADMIN_USER}
+EOF
+  echo "/etc/cron.allow を置いた（root と ${ADMIN_USER} のみ）"
+}
+
+# claude の linger（ログアウト後もユーザーのサービスを残す設定）を polkit で禁じる
+# （ADR 0060 決定2）。既定では set-self-linger は誰でも許可で、enable-linger すると
+# user@<UID>.service が残る。書き方は stacks/admin-console/webhook/polkit/49-admin-console.rules
+# に合わせる。49 は admin-console 用で別のスクリプトが置くので、ここは48の別ファイル。
+# polkit は rules.d を監視しているので、再起動は要らない。
+setup_claude_polkit_rule() {
+  install -m 644 -D /dev/stdin /etc/polkit-1/rules.d/48-claude-no-linger.rules <<EOF
+// ${CLAUDE_USER} が loginctl enable-linger で居座れないようにする（docs/adr/0060 決定2）。
+// bootstrap/setup.sh が配置する。
+polkit.addRule(function(action, subject) {
+    if (subject.user != "${CLAUDE_USER}") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (action.id == "org.freedesktop.login1.set-self-linger" ||
+        action.id == "org.freedesktop.login1.set-user-linger") {
+        return polkit.Result.NO;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
+EOF
+}
+
+# claude のログアウト時にそのセッションのプロセスを殺す（ADR 0060 決定2）。
+# 既定の KillUserProcesses=no だと、nohup したプロセスがログアウト後も残る。
+# KillOnlyUsers で claude だけに限る（ino の tmux などを巻き込まない）。
+# logind は設定を起動時にしか読まないので、内容が変わったときだけ再起動する。
+setup_claude_logind_dropin() {
+  local conf=/etc/systemd/logind.conf.d/99-m-ino-jp-claude.conf new
+  new="$(printf '[Login]\nKillUserProcesses=yes\nKillOnlyUsers=%s\n' "${CLAUDE_USER}")"
+  if [[ -f "${conf}" && "$(cat "${conf}")" == "${new}" ]]; then
+    echo "logind の drop-in は変更なし（再起動しない）"
+    return 0
+  fi
+  install -m 644 -D /dev/stdin "${conf}" <<<"${new}"
+  # 稼働中のVPSで再起動するときは、ino のセッションを残したまま行い、新しい ino の
+  # ログインができることを確かめる（docs/94）。再起動しても既存のセッションは切れない。
+  systemctl restart systemd-logind
+  echo "systemd-logind を再起動した（新しい drop-in を読ませるため）"
+}
+
+# apport を止めて mask する（ADR 0060 決定5）。クラッシュしたプロセスのコアダンプを
+# 他ユーザーが置いたハンドラ経由で処理させない。/etc/default/apport は編集しない
+# （パッケージの更新で衝突するため。mask は unit 側で完結する）。
+disable_apport() {
+  systemctl disable --now apport.service >/dev/null 2>&1 || true
+  systemctl mask apport.service
+  # 止めても core_pattern が apport のまま残ることがある。再起動までそのままに
+  # しない（ブート後の既定値は mask 済みなので core）。
+  if grep -q apport /proc/sys/kernel/core_pattern 2>/dev/null; then
+    sysctl -w kernel.core_pattern=core >/dev/null
+  fi
+  echo "apport.service: $(systemctl is-enabled apport.service 2>&1 || true) / core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+}
+
+# ---------------------------------------------------------------------------
 # Claude Code 用の読み取り専用ユーザー（docs/adr/0057-claude-readonly-user.md）
 # ---------------------------------------------------------------------------
 # 関数にしてあるのは、通しの実行（末尾で呼ぶ）と、稼働中VPSへ足すだけの実行
@@ -101,6 +294,9 @@ print_warnings() {
 # 毎分書き出す docker の状態スナップショット（/run/m-ino-jp/snapshot/）で与える。
 setup_claude_user() {
   local uid home snap_dir="/run/m-ino-jp/snapshot"
+
+  # 副作用（グループの付け外し・authorized_keys の上書き）の前に、対象が妥当か確かめる。
+  guard_claude_user
 
   # 鍵の検証は副作用の前にやる。壊れた値でユーザーだけ作ると半端な状態が残る。
   if [[ -n "${CLAUDE_SSH_PUBLIC_KEY}" ]]; then
@@ -126,27 +322,23 @@ setup_claude_user() {
   uid="$(id -u "${CLAUDE_USER}")"
   home="$(getent passwd "${CLAUDE_USER}" | cut -d: -f6)"
 
-  # リポジトリ（/srv/m-ino-jp）は ino の所有なので、claude が git を使うと
-  # "dubious ownership" で拒否される。claude 自身の ~/.gitconfig に、このパスだけを
-  # 許可する（'*' にはしない）。権限昇格にはならない: claude はリポジトリに書けず、
-  # ino 所有の設定が下位の claude 権限で読まれる向き。VPS が取り込み済みのコミットと、
-  # サーバ上の直接編集（git status）を claude が確認できるようにするため。
-  # --replace-all なので何度流しても1行のまま（冪等）。
-  if command -v git >/dev/null 2>&1; then
-    runuser -u "${CLAUDE_USER}" -- env HOME="${home}" \
-      git config --global --replace-all safe.directory /srv/m-ino-jp
-  fi
+  log "claude 2. ホームの所有者とSSH公開鍵"
+  # 所有者の是正は鍵の有無によらず毎回行う（ADR 0060 決定3）。~/.gitconfig もここで
+  # root が書く。
+  lock_claude_home "${home}"
 
-  log "claude 2. SSH公開鍵"
   if [[ -n "${CLAUDE_SSH_PUBLIC_KEY}" ]]; then
-    install -d -m 700 -o "${CLAUDE_USER}" -g "${CLAUDE_USER}" "${home}/.ssh"
+    # root 所有のディレクトリ・ファイルにする。claude 自身が authorized_keys を書き換えて
+    # restrict を外したり鍵を足したりできないようにするため。sshd の StrictModes は
+    # 「所有者が本人か root で、他人に書けない」ことを要求するので、これで通る。
+    install -d -m 755 -o root -g root "${home}/.ssh"
     # restrict は pty・各種転送・~/.ssh/rc を一括で禁じる。pty だけ戻すのは、
     # 人間が入って調べるときに対話シェルが使えないと不便なため。
-    install -m 600 -o "${CLAUDE_USER}" -g "${CLAUDE_USER}" /dev/stdin \
+    install -m 644 -o root -g root /dev/stdin \
       "${home}/.ssh/authorized_keys" <<EOF
 restrict,pty ${CLAUDE_SSH_PUBLIC_KEY}
 EOF
-    echo "公開鍵を ${home}/.ssh/authorized_keys に配置した"
+    echo "公開鍵を ${home}/.ssh/authorized_keys に配置した（root 所有）"
   else
     warn "CLAUDE_SSH_PUBLIC_KEY が空。${CLAUDE_USER} は作ったが、SSHでは入れない"
   fi
@@ -177,17 +369,25 @@ EOF
     warn "01-hardening.conf が無いので AllowUsers は触っていない"
   fi
 
-  log "claude 4. 資源の上限"
+  log "claude 4. 資源とネットワークの上限"
   # 2GBのホストで、ログインユーザーの暴走（grep -r、fork爆弾など）が常駐サービスを
   # OOMや swap 嵐に巻き込むのを防ぐ。swap を禁じるのは、8GBのswapファイルを
   # このユーザーに食い潰させないため。UID は adduser 任せで再構築のたびに変わりうる
   # ので、ここで引いた実値からファイル名を作る。
+  #
+  # IPAddressDeny=any: claude は IP 通信を一切しない前提（journalctl・systemctl は
+  # D-Bus、git は手元で完結する。名前を引くなら resolvectl query）。ホストは docker の
+  # ブリッジ（172.20.0.1 など）にアドレスを持つので、塞がないと claude が Caddy を
+  # 迂回して、認証を Caddy の forward_auth に任せている MCP コンテナ（nextcloud-mcp
+  # など）へ直接つなげる（ADR 0060 決定1）。SSH の接続は sshd 側で作られたソケットなので
+  # 巻き込まれない。
   install -m 644 -D /dev/stdin "/etc/systemd/system/user-${uid}.slice.d/99-m-ino-jp.conf" <<'EOF'
 [Slice]
 MemoryMax=256M
 MemorySwapMax=0
 TasksMax=200
 CPUQuota=100%
+IPAddressDeny=any
 EOF
   systemctl daemon-reload
 
@@ -261,7 +461,14 @@ EOF
     warn "docker が未導入のためスナップショットを入れていない。docker 導入後に ONLY_CLAUDE_USER=1 で再実行すること"
   fi
 
-  log "claude 6. 権限の確認"
+  log "claude 6. 居座りの封じ込め（cron・linger・logind・apport）"
+  setup_cron_allow
+  setup_claude_polkit_rule
+  setup_claude_logind_dropin
+  disable_apport
+  write_needrestart_conf
+
+  log "claude 7. 権限の確認"
   # 構成が崩れていたら、ここで落とす。「読み取り専用」が嘘のまま残るのが一番まずい。
   if id -nG "${CLAUDE_USER}" | tr ' ' '\n' | grep -Eqx 'sudo|docker|lxd|root'; then
     echo "${CLAUDE_USER} が特権グループに入っている: $(id -nG "${CLAUDE_USER}")" >&2
@@ -658,9 +865,8 @@ systemctl daemon-reload
 systemctl restart apt-daily.timer apt-daily-upgrade.timer
 
 # needrestart が対話プロンプトを出すと自動更新が止まるので自動再起動にする
-install -m 644 -D /dev/stdin /etc/needrestart/conf.d/99-m-ino-jp.conf <<'EOF'
-$nrconf{restart} = 'a';
-EOF
+# （drop-in の中身は write_needrestart_conf。ONLY_CLAUDE_USER=1 でも同じものを通す）
+write_needrestart_conf
 
 systemctl enable --now unattended-upgrades
 
