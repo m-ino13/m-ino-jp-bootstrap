@@ -60,4 +60,11 @@ git push
 
 `bootstrap/setup.sh` を変更したのに公開用リポジトリへの反映を忘れると、**さくらのコンソールから実行されるスクリプトが古いまま**になる。変更のたびに同期する習慣にする。次にOS再インストールする前には、必ず公開用リポジトリの中身が最新か確認すること。
 
+**公開用リポジトリが最新かは、ローカルの `setup.sh` と比べて確かめる**（`cmp` が何も出さずに `一致` と出れば同じ。`raw.githubusercontent.com` は数分キャッシュされるので、push 直後は古い値が返ることがある）。`startup-script.sh` が `main` を固定せずに取得する理由は ADR 0002 の追記（2026-10-08）。
+
+```bash
+# ローカルで実行（m-ino-jp のリポジトリルート）
+curl -fsSL https://raw.githubusercontent.com/m-ino13/m-ino-jp-bootstrap/main/bootstrap/setup.sh | cmp - bootstrap/setup.sh && echo 一致
+```
+
 **稼働中のVPSで `ONLY_CLAUDE_USER=1` を流すだけなら、この同期は要らない**（VPS上のチェックアウトの `bootstrap/setup.sh` を直接実行するため）。同期が要るのは、OS再インストール時の `startup-script.sh` が公開用リポジトリから `setup.sh` を取る経路のためだけ。

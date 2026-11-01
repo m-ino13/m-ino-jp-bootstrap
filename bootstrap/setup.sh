@@ -671,6 +671,15 @@ vm.vfs_cache_pressure = 50
 # SYN flood 対策
 net.ipv4.tcp_syncookies = 1
 EOF
+
+# CVE-2026-98432（カーネルの IPv4 TCP の use-after-free）への対策として MPTCP を止める
+# （ADR 0063）。2026-10-30 に稼働中の VPS へ手で入れたものと、ファイル名も中身も揃えてある。
+# MPTCP は使っていないので、修正済みのカーネルに上がった後も残しておく。
+# この値はネットワーク名前空間ごとの設定で、コンテナには届かない（新しい名前空間は既定の
+# 1 で始まる）。80/443 を受ける Caddy は stacks/proxy/compose.yaml の sysctls で別に止めている。
+install -m 644 -D /dev/stdin /etc/sysctl.d/90-cve-2026-98432.conf <<'EOF'
+net.mptcp.enabled = 0
+EOF
 sysctl --system >/dev/null
 
 # ---------------------------------------------------------------------------
